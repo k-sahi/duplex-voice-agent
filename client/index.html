@@ -1,0 +1,170 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>duplex-engine</title>
+<style>
+  :root { --bg:#0f1115; --panel:#181b22; --border:#2a2f3b; --text:#e8eaf0; --muted:#8a90a0;
+          --idle:#5b6170; --listen:#3fb68b; --think:#e0a43a; --speak:#6c8cff; }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--text); font:14px/1.45 system-ui,sans-serif;
+         display:flex; justify-content:center; padding:24px 16px; }
+  main { width:min(640px,100%); display:flex; flex-direction:column; gap:14px; }
+  h1 { font-size:18px; margin:0; }
+  .row { display:flex; gap:10px; align-items:center; flex-wrap:wrap; }
+  button { background:var(--panel); color:var(--text); border:1px solid var(--border);
+           padding:10px 16px; border-radius:10px; font-size:14px; cursor:pointer; }
+  #state { padding:6px 12px; border-radius:999px; font-weight:600; background:var(--idle); }
+  .card { background:var(--panel); border:1px solid var(--border); border-radius:12px; padding:12px 14px; }
+  .stats { display:grid; grid-template-columns:repeat(3,1fr); gap:10px; }
+  .stats div span { display:block; color:var(--muted); font-size:12px; }
+  .stats div b { font-size:20px; }
+  .meter { height:8px; background:#222632; border-radius:4px; overflow:hidden; flex:1; min-width:120px; }
+  .meter i { display:block; height:100%; width:0; background:var(--listen); }
+  #log { height:260px; overflow:auto; font:12px/1.5 ui-monospace,Consolas,monospace; color:var(--muted); }
+  #log .cancel, #log .flush { color:#ff8a8a; }
+  .hint { color:var(--muted); font-size:12px; }
+</style>
+</head>
+<body>
+<main>
+  <h1>duplex-engine · Step 4: echo agent</h1>
+  <div class="row">
+    <button id="go">Start</button>
+    <span id="state">OFFLINE</span>
+    <div class="meter" title="mic level"><i id="lvl"></i></div>
+  </div>
+  <p class="hint">Use headphones. Say a sentence and pause: the agent plays your words back. Talk over it and it should stop at once.</p>
+  <div class="card stats">
+    <div><span>Last TTFO (from VAD end)</span><b id="ttfo">–</b></div>
+    <div><span>Tick lateness p99</span><b id="late">–</b></div>
+    <div><span>Overruns / skipped</span><b id="over">–</b></div>
+  </div>
+  <div class="card"><div id="log"></div></div>
+</main>
+
+<script>
+// AudioWorklets run on the audio thread. Defined inline so this stays one file.
+const WORKLETS = `
+class Mic extends AudioWorkletProcessor {
+  constructor() { super(); this.buf = new Int16Array(320); this.n = 0; }   // 320 samples = 20 ms at 16 kHz
+  process(inputs) {
+    const ch = inputs[0][0];
+    if (!ch) return true;
+    for (let i = 0; i < ch.length; i++) {
+      const s = Math.max(-1, Math.min(1, ch[i]));
+      this.buf[this.n++] = s < 0 ? s * 0x8000 : s * 0x7fff;               // float -> int16
+      if (this.n === 320) {
+        this.port.postMessage(this.buf.buffer, [this.buf.buffer]);
+        this.buf = new Int16Array(320); this.n = 0;
+      }
+    }
+    return true;
+  }
+}
+registerProcessor('mic', Mic);
+
+class Player extends AudioWorkletProcessor {
+  constructor() {
+    super(); this.q = []; this.cur = null; this.pos = 0; this.playing = false;
+    this.port.onmessage = (e) => {
+      if (e.data === 'flush') { this.q = []; this.cur = null; this.playing = false; }   // barge-in
+      else this.q.push(new Int16Array(e.data));
+    };
+  }
+  process(_, outputs) {
+    const out = outputs[0][0];
+    if (!this.playing && this.q.length >= 3) this.playing = true;   // 60 ms jitter buffer
+    for (let i = 0; i < out.length; i++) {
+      if (!this.cur || this.pos >= this.cur.length) {
+        if (this.playing && this.q.length) { this.cur = this.q.shift(); this.pos = 0; }
+        else { this.cur = null; this.playing = false; out.fill(0, i); break; }
+      }
+      out[i] = this.cur[this.pos++] / 32768;
+    }
+    return true;
+  }
+}
+registerProcessor('player', Player);
+`;
+
+const $ = (id) => document.getElementById(id);
+const COLORS = { IDLE:'--idle', LISTENING:'--listen', THINKING:'--think', SPEAKING:'--speak' };
+let ctx, stream, ws, player, running = false;
+
+function log(text, cls = '') {
+  const line = document.createElement('div');
+  line.textContent = text; line.className = cls;
+  $('log').prepend(line);
+}
+
+function setState(s) {
+  $('state').textContent = s;
+  $('state').style.background = `var(${COLORS[s] || '--idle'})`;
+}
+
+function onEvent(m) {
+  const t = String(m.t_ms).padStart(6) + ' ms  ';
+  switch (m.type) {
+    case 'state':
+      setState(m.state);
+      log(t + '-> ' + m.state + (m.ttfo_ms != null ? `   (TTFO ${m.ttfo_ms} ms)` : ''));
+      if (m.ttfo_ms != null) $('ttfo').textContent = m.ttfo_ms + ' ms';
+      break;
+    case 'vad': log(t + (m.speaking ? 'VAD: speech start' : 'VAD: speech end')); break;
+    case 'transcript': log(t + 'transcript ' + m.text); break;
+    case 'cancel': log(t + 'cancel agent jobs (' + m.reason + ')', 'cancel'); break;
+    case 'flush': player.port.postMessage('flush'); log(t + 'flush playback', 'flush'); break;
+    case 'stats':
+      $('late').textContent = m.tick_late_p99_ms + ' ms';
+      $('over').textContent = m.overruns + ' / ' + m.skipped;
+      break;
+  }
+}
+
+async function start() {
+  ctx = new AudioContext({ sampleRate: 16000 });   // browser resamples mic and speakers for us
+  const url = URL.createObjectURL(new Blob([WORKLETS], { type: 'application/javascript' }));
+  await ctx.audioWorklet.addModule(url);
+
+  stream = await navigator.mediaDevices.getUserMedia({
+    audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+  });
+  const mic = new AudioWorkletNode(ctx, 'mic', { numberOfOutputs: 0 });
+  ctx.createMediaStreamSource(stream).connect(mic);
+  player = new AudioWorkletNode(ctx, 'player', { numberOfInputs: 0, outputChannelCount: [1] });
+  player.connect(ctx.destination);
+
+  ws = new WebSocket(`ws://${location.host}/ws`);
+  ws.binaryType = 'arraybuffer';
+  ws.onopen = () => { setState('IDLE'); log('connected'); };
+  ws.onclose = () => { setState('OFFLINE'); log('disconnected'); };
+  ws.onmessage = (e) => {
+    if (typeof e.data === 'string') onEvent(JSON.parse(e.data));
+    else player.port.postMessage(e.data, [e.data]);           // a 20 ms agent audio frame
+  };
+
+  mic.port.onmessage = (e) => {
+    const s = new Int16Array(e.data);
+    let sum = 0; for (const v of s) sum += v * v;
+    $('lvl').style.width = Math.min(100, Math.sqrt(sum / s.length) / 40) + '%';
+    if (ws.readyState === WebSocket.OPEN) ws.send(e.data);    // a 20 ms mic frame (640 bytes)
+  };
+}
+
+function stop() {
+  ws?.close(); stream?.getTracks().forEach((t) => t.stop()); ctx?.close();
+  $('lvl').style.width = '0';
+}
+
+$('go').onclick = async () => {
+  try {
+    if (running) { stop(); $('go').textContent = 'Start'; }
+    else { await start(); $('go').textContent = 'Stop'; }
+    running = !running;
+  } catch (err) { log('error: ' + err.message, 'cancel'); }
+};
+</script>
+</body>
+</html>
