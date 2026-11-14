@@ -17,7 +17,7 @@
            padding:10px 16px; border-radius:10px; font-size:14px; cursor:pointer; }
   #state { padding:6px 12px; border-radius:999px; font-weight:600; background:var(--idle); }
   .card { background:var(--panel); border:1px solid var(--border); border-radius:12px; padding:12px 14px; }
-  .stats { display:grid; grid-template-columns:repeat(3,1fr); gap:10px; }
+  .stats { display:grid; grid-template-columns:repeat(2,1fr); gap:10px; }
   .stats div span { display:block; color:var(--muted); font-size:12px; }
   .stats div b { font-size:20px; }
   .meter { height:8px; background:#222632; border-radius:4px; overflow:hidden; flex:1; min-width:120px; }
@@ -29,15 +29,17 @@
 </head>
 <body>
 <main>
-  <h1>duplex-engine · Step 4: echo agent</h1>
+  <h1>duplex-engine · Step 5: Silero VAD + Whisper</h1>
   <div class="row">
     <button id="go">Start</button>
     <span id="state">OFFLINE</span>
     <div class="meter" title="mic level"><i id="lvl"></i></div>
   </div>
-  <p class="hint">Use headphones. Say a sentence and pause: the agent plays your words back. Talk over it and it should stop at once.</p>
+  <p class="hint">Use headphones. Say a sentence and pause: your words appear as you talk, then the agent plays them back. Talk over it and it stops.</p>
+  <div class="card"><span class="hint">You said</span><div id="said" style="font-size:18px;min-height:27px">…</div></div>
   <div class="card stats">
     <div><span>Last TTFO (from VAD end)</span><b id="ttfo">–</b></div>
+    <div><span>Final transcript took (ASR)</span><b id="asr">–</b></div>
     <div><span>Tick lateness p99</span><b id="late">–</b></div>
     <div><span>Overruns / skipped</span><b id="over">–</b></div>
   </div>
@@ -113,7 +115,14 @@ function onEvent(m) {
       if (m.ttfo_ms != null) $('ttfo').textContent = m.ttfo_ms + ' ms';
       break;
     case 'vad': log(t + (m.speaking ? 'VAD: speech start' : 'VAD: speech end')); break;
-    case 'transcript': log(t + 'transcript ' + m.text); break;
+    case 'hello': log(`server: VAD = ${m.vad}, ASR = ${m.asr}`); break;
+    case 'busy': log('server busy: ' + m.reason + ' Try again in a minute.', 'cancel'); break;
+    case 'partial': $('said').textContent = m.text + ' …'; $('said').style.opacity = 0.6; break;
+    case 'transcript':
+      $('said').textContent = m.text; $('said').style.opacity = 1;
+      $('asr').textContent = m.asr_ms + ' ms';
+      log(t + `transcript "${m.text}"  (${m.audio_ms} ms audio, ASR ${m.asr_ms} ms)`);
+      break;
     case 'cancel': log(t + 'cancel agent jobs (' + m.reason + ')', 'cancel'); break;
     case 'flush': player.port.postMessage('flush'); log(t + 'flush playback', 'flush'); break;
     case 'stats':
@@ -136,10 +145,15 @@ async function start() {
   player = new AudioWorkletNode(ctx, 'player', { numberOfInputs: 0, outputChannelCount: [1] });
   player.connect(ctx.destination);
 
-  ws = new WebSocket(`ws://${location.host}/ws`);
+  // The live demo is served over https, which requires a secure WebSocket (wss).
+  const scheme = location.protocol === 'https:' ? 'wss' : 'ws';
+  ws = new WebSocket(`${scheme}://${location.host}/ws`);
   ws.binaryType = 'arraybuffer';
   ws.onopen = () => { setState('IDLE'); log('connected'); };
-  ws.onclose = () => { setState('OFFLINE'); log('disconnected'); };
+  ws.onclose = () => {
+    setState('OFFLINE'); log('disconnected (server restarted or stopped): click Start to reconnect');
+    stop(); running = false; $('go').textContent = 'Start';
+  };
   ws.onmessage = (e) => {
     if (typeof e.data === 'string') onEvent(JSON.parse(e.data));
     else player.port.postMessage(e.data, [e.data]);           // a 20 ms agent audio frame

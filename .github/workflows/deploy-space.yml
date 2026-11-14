@@ -1,0 +1,39 @@
+# Copies this repo to a Hugging Face Space on every push to main,
+# which rebuilds the live demo.
+#
+# One-time setup (GitHub repo -> Settings -> Secrets and variables -> Actions):
+#   Secret   HF_TOKEN  = a Hugging Face access token with "Write" permission
+#   Variable HF_SPACE  = your Space id, e.g.  your-hf-username/duplex-voice-agent
+name: Deploy live demo
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    if: ${{ vars.HF_SPACE != '' }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # A Space reads its settings from a block at the top of README.md.
+      # Add it only in the copy sent to Hugging Face, so the GitHub README stays clean.
+      - name: Add Space settings to README
+        run: |
+          printf -- '---\ntitle: duplex-engine\nemoji: 🎙️\ncolorFrom: indigo\ncolorTo: green\nsdk: docker\napp_port: 7860\npinned: false\n---\n\n' > header.md
+          cat header.md README.md > README.tmp && mv README.tmp README.md && rm header.md
+          git config user.name "github-actions"
+          git config user.email "github-actions@users.noreply.github.com"
+          git commit -am "Add Space settings"
+
+      - name: Push to Hugging Face
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          HF_SPACE: ${{ vars.HF_SPACE }}
+        run: |
+          HF_USER="${HF_SPACE%%/*}"
+          git push --force "https://${HF_USER}:${HF_TOKEN}@huggingface.co/spaces/${HF_SPACE}" HEAD:main

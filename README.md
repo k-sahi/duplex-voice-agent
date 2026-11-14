@@ -1,14 +1,16 @@
 # duplex-engine
 
+[![See live](https://img.shields.io/badge/%E2%96%B6%20See%20live-demo-6c8cff?style=for-the-badge)](https://nivi2700-duplex-voice-agent.hf.space)
+
 A real-time engine for a full-duplex voice agent: it listens while it speaks, and stops within one 20 ms tick when you interrupt it.
 
 Most voice bots take turns like a walkie-talkie: listen, think, speak, repeat. This project builds the runtime that lets a conversation overlap, the way people actually talk. A fixed-rate tick loop keeps audio flowing no matter how slow the AI models are, and a pure state machine decides who has the floor.
 
-> **Status:** Steps 1–4 of 9 are done. The full real-time path works end to end with a stand-in "echo agent" that plays your own words back. Speech recognition, an LLM and text-to-speech come next (see [Roadmap](#roadmap)).
+> **Status:** Steps 1–5 of 9 are done. The engine hears you with Silero VAD and transcribes you live with faster-whisper; the reply is still a stand-in "echo agent" that plays your own words back. An LLM and text-to-speech come next (see [Roadmap](#roadmap)).
 
-## Demo
+## Example run
 
-Run the server, open the page, say a sentence and pause: the agent replies. Talk over it and it stops.
+Run the server, open the page, and talk: your words appear as you speak. Pause and the agent replies. Talk over it and it stops.
 
 ```
   2376 ms  VAD: speech start
@@ -19,6 +21,14 @@ Run the server, open the page, say a sentence and pause: the agent replies. Talk
   4385 ms  -> SPEAKING (TTFO 329 ms)
   5884 ms  -> IDLE
 ```
+
+## Live demo
+
+**[Open the live demo](https://nivi2700-duplex-voice-agent.hf.space)**, click **Start**, allow the microphone, and talk. Wear headphones, or the agent will hear itself and interrupt itself.
+
+- The agent is still the Step 5 stand-in: it transcribes you live, then plays your own words back. Talk over it and it stops.
+- It runs on a free shared CPU, so the numbers include your network round trip and are slower than running it locally. Up to 3 people can talk to it at once.
+- If nobody has used it for a while it is asleep; the first visit can take a minute to wake it up.
 
 ## Architecture
 
@@ -66,6 +76,10 @@ stateDiagram-v2
 
 **Events apply only on a tick.** Anything can `post()` an event at any time, but state changes happen at one point, in order. A barge-in flushes the output buffer before that tick picks its frame, so no stale speech goes out after an interrupt.
 
+**Models never run on the tick.** Whisper takes hundreds of milliseconds per call, so every transcription runs through `asyncio.to_thread` on a worker thread. The model is loaded once with two workers, so a final transcript never waits behind a partial one. A turn counter drops results that arrive after the user has moved on.
+
+**One turn, even with a pause.** If you stop for a moment and keep talking before the transcript comes back, the engine keeps your earlier words and transcribes the whole sentence as one turn.
+
 **State follows what the listener hears.** `SPEAKING` starts when the first agent frame is actually sent and ends when the last one is, not when TTS finishes generating. Late events from cancelled jobs are ignored.
 
 ## Measured so far
@@ -77,7 +91,7 @@ stateDiagram-v2
 | Tick lateness, p99 | 1.6 ms (Linux) | Windows needs 1 ms timer resolution, set at server start |
 | TTFO with the echo agent | ~330 ms from VAD end | Includes a simulated 300 ms model delay; measured from VAD's end-of-turn decision, which itself waits 500 ms |
 
-Real-model latency breakdowns (ASR, LLM first token, TTS first audio) arrive with Steps 5–8.
+The page also shows how long the final transcript took. Full per-stage breakdowns (ASR, LLM first token, TTS first audio) arrive with Steps 6–8.
 
 ## Run it
 
@@ -92,8 +106,10 @@ pip install -r requirements.txt
 
 pytest -q                          # run the tests
 python -m bench.tick_demo          # scripted conversation with a barge-in, plus tick stats
-uvicorn server.main:app --reload   # then open http://localhost:8000
+uvicorn server.main:app           # then open http://localhost:8000
 ```
+
+The first server start downloads the Whisper model (about 140 MB for `base.en`). Pick a smaller or larger one with `DUPLEX_ASR_MODEL=tiny.en` or `small.en`.
 
 Use headphones for the live demo. Without them the agent hears its own voice and interrupts itself; handling that properly is part of Step 7.
 
@@ -105,13 +121,16 @@ engine/
   tick.py            20 ms tick loop with timing stats
   audio.py           frame constants and the output buffer
   session.py         one conversation, advanced only by ticks
-  vad_energy.py      loudness-based VAD (placeholder for Silero)
+  speech_gate.py     turns speech probabilities into start/end, with hysteresis
+  vad_energy.py      loudness-based VAD (fallback)
 server/
-  main.py            FastAPI app: page at /, audio at /ws
-  connection.py      per-browser connection, echo agent, event stream
+  main.py            FastAPI app: page at /, audio at /ws, loads models once
+  connection.py      per-browser connection: VAD, partial + final ASR, echo agent
+  vad.py             Silero VAD wrapper (512-sample windows)
+  asr.py             faster-whisper wrapper, run on worker threads
 client/
   index.html         mic capture, playback, state and latency display
-tests/               state machine, buffer, tick, VAD and end-to-end tests
+tests/               state machine, buffer, tick, VAD, gate and end-to-end tests (no models needed)
 bench/
   tick_demo.py       scripted conversation with a fake TTS
 ```
@@ -122,7 +141,7 @@ bench/
 - [x] Step 2: pure state machine with barge-in
 - [x] Step 3: 20 ms tick loop, output buffer, session
 - [x] Step 4: WebSocket server, browser client, echo agent
-- [ ] Step 5: Silero VAD and streaming speech recognition (faster-whisper)
+- [x] Step 5: Silero VAD and streaming speech recognition (faster-whisper)
 - [ ] Step 6: streaming LLM and streaming TTS (Piper), sentence-level chunking
 - [ ] Step 7: real barge-in with task cancellation and self-interruption handling
 - [ ] Step 8: per-stage latency tracing, p50/p95/p99 benchmarks, regression checks

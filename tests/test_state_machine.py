@@ -35,3 +35,8 @@ def test_empty_transcript_returns_to_idle():
 def test_late_event_from_cancelled_job_is_ignored():
     s, a = transition(State.LISTENING, AgentAudioStarted(0))
     assert s == State.LISTENING and a == []
+
+def test_resume_talking_before_transcript_keeps_listening():
+    # You paused long enough for VAD to end the turn, then kept talking
+    s, a = transition(State.LISTENING, UserSpeechStarted(0))
+    assert s == State.LISTENING and a == [StartASR()]

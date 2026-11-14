@@ -1,3 +1,7 @@
+"""Pure conversation state machine: (state, event) -> (new_state, actions).
+
+No I/O, no asyncio, no models. This is the part designed to be ported to Rust.
+"""
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -5,10 +9,10 @@ from enum import Enum, auto
 
 
 class State(Enum):
-    IDLE = auto()
-    LISTENING = auto()
-    THINKING = auto()
-    SPEAKING = auto()
+    IDLE = auto()       # nobody talking
+    LISTENING = auto()  # user is speaking
+    THINKING = auto()   # user finished, agent preparing a reply
+    SPEAKING = auto()   # agent audio is playing
 
 
 # ---------- Events (inputs) ----------
@@ -68,6 +72,9 @@ def transition(state: State, event: Event) -> tuple[State, list[Action]]:
                 FlushPlayback(),
                 StartASR(),
             ]
+        # User resumed talking before the transcript came back: same turn, keep listening
+        case (State.LISTENING, UserSpeechStarted()):
+            return State.LISTENING, [StartASR()]
         case (State.LISTENING, UserSpeechEnded()):
             return State.LISTENING, [FinalizeASR()]
         case (State.LISTENING, TranscriptFinal(text=text)) if text.strip():
