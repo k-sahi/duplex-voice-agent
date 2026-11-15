@@ -21,6 +21,6 @@ RUN python -c "from faster_whisper import WhisperModel; WhisperModel('base.en', 
 COPY --chown=user . .
 
 # Cloud Run tells the container which port to use through $PORT (8080 by default)
-ENV PORT=8080
-EXPOSE 8080
-CMD ["sh", "-c", "uvicorn server.main:app --host 0.0.0.0 --port ${PORT}"]
+# Hugging Face expects port 7860. Cloud Run overrides $PORT with its own value.
+ENV PORT=7860
+EXPOSE 7860
