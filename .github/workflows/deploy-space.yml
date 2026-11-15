@@ -17,8 +17,6 @@ jobs:
     if: ${{ vars.HF_SPACE != '' }}
     steps:
       - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
 
       # A Space reads its settings from a block at the top of README.md.
       # Add it only in the copy sent to Hugging Face, so the GitHub README stays clean.
@@ -26,14 +24,22 @@ jobs:
         run: |
           printf -- '---\ntitle: duplex-engine\nemoji: 🎙️\ncolorFrom: indigo\ncolorTo: green\nsdk: docker\napp_port: 7860\npinned: false\n---\n\n' > header.md
           cat header.md README.md > README.tmp && mv README.tmp README.md && rm header.md
+
+      # Send a single fresh commit of today's files, not the whole history.
+      # (Old commits contain binary files that Hugging Face rejects.)
+      - name: Make a clean snapshot
+        run: |
           git config user.name "github-actions"
           git config user.email "github-actions@users.noreply.github.com"
-          git commit -am "Add Space settings"
+          git checkout --orphan space-deploy
+          git add -A
+          git commit -q -m "Deploy ${GITHUB_SHA::7} from GitHub"
 
       - name: Push to Hugging Face
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
           HF_SPACE: ${{ vars.HF_SPACE }}
         run: |
+          if [ -z "$HF_TOKEN" ]; then echo "::error::The HF_TOKEN secret is missing"; exit 1; fi
           HF_USER="${HF_SPACE%%/*}"
-          git push --force "https://${HF_USER}:${HF_TOKEN}@huggingface.co/spaces/${HF_SPACE}" HEAD:main
+          git push --force "https://${HF_USER}:${HF_TOKEN}@huggingface.co/spaces/${HF_SPACE}" space-deploy:main
